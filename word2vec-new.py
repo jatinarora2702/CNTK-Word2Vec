@@ -22,12 +22,11 @@ from cntk.utils import ProgressPrinter
 
 curr_epoch = 0
 emb_size = 256
-max_range = 100
-minibatch_size = 128
-num_epochs = 2
+minibatch_size = 512
+num_epochs = 1
 skip_window = 1
-vocab_size = 50000
-words_per_epoch = 50000
+vocab_size = 10000
+words_per_epoch = 10000
 words_seen = 0
 
 
@@ -45,25 +44,21 @@ def lrmodel(inp, out_dim):
 
 
 def train(emb_size, vocab_size, batch_size, vocab_count):
-    inp = input_variable(shape=(1,))
+    inp = input_variable(shape=(vocab_size,))
     label = input_variable(shape=(vocab_size,))
 
     init_width = 0.5 / emb_size
     emb = parameter(shape=(vocab_size, emb_size), init=uniform(scale=init_width))
-
-    # k = reshape(inp, shape=()).eval()
-    k = 0
-    embinp = reshape(slice(emb, axis=0, begin_index=k, end_index=k+1), (emb_size,))
-
+    embinp = times(inp, emb)
+    
     z = lrmodel(embinp, vocab_size)        # logistic regression model
     loss = cross_entropy_with_softmax(z, label)
     normloss = element_divide(loss, constant(value=batch_size))
 
     eval_error = classification_error(z, label)
-    lr_per_minibatch = learning_rate_schedule([0.5], UnitType.minibatch)
-    print(z.parameters)
+    lr_per_minibatch = learning_rate_schedule([0.005], UnitType.minibatch)
     learner = sgd(z.parameters, lr=lr_per_minibatch)
-    trainer = Trainer(z, loss, eval_error, learner)
+    trainer = Trainer(z, normloss, eval_error, learner)
 
     return inp, label, trainer
 
@@ -104,11 +99,14 @@ def build_dataset(words):
     global data, vocab_size, vocab_count, words_per_epoch, id2word
     count = [['UNK', -1]]
     count.extend(collections.Counter(words).most_common(vocab_size - 1))
+    # print(len(count))
+    # print(count[-1])
     dictionary = dict()
     id2word = list()
     for word, _ in count:
         dictionary[word] = len(dictionary)
         id2word.append(word)
+    # print(dictionary)
     data = list()
     unk_count = 0
     for word in words:
@@ -120,10 +118,9 @@ def build_dataset(words):
         data.append(index)
     count[0][1] = unk_count
     reverse_dictionary = dict(zip(dictionary.values(), dictionary.keys()))
-    vocabcnt = list()
+    vocab_count = list()
     for elem in sorted(reverse_dictionary.items()):
-        vocabcnt.append(count[elem[0]][1])
-    vocab_count = vocabcnt
+        vocab_count.append(count[elem[0]][1])
     words_per_epoch = len(data)
 
 
@@ -159,7 +156,7 @@ def generate_batch(batch_size, skip_window):
         data_index += 1
         if data_index >= len(data):
             curr_epoch += 1
-            data_index %= len(data)
+            data_index -= len(data)
     for i in range(batch_size // num_skips):
         target = skip_window    # target label at the center of the buffer
         targets_to_avoid = [ skip_window ]
@@ -174,8 +171,7 @@ def generate_batch(batch_size, skip_window):
         data_index += 1
         if data_index >= len(data):
             curr_epoch += 1
-            data_index %= len(data)
-    batch = batch.astype(np.float32)      
+            data_index -= len(data)
     return batch, labels
 
 
@@ -206,21 +202,26 @@ def main():
         print('Insufficient number of arguments')
         exit(1)
     filename = sys.argv[1]
-    # process_text(filename)
+    process_text(filename)
 
     inp, label, trainer = train(emb_size, vocab_size, minibatch_size, vocab_count)
     pp = ProgressPrinter(128)
     for _epoch in range(num_epochs):
-        for i in range(5):
-            # features, labels = generate_batch(minibatch_size, skip_window)
-            # labels = get_one_hot(labels)
-            features, labels = generate_random_data_sample(minibatch_size, 1, vocab_size)
+        for i in range(200):
+            features, labels = generate_batch(minibatch_size, skip_window)
+            features = get_one_hot(features)
+            labels = get_one_hot(labels)
+            # features, labels = generate_random_data_sample(minibatch_size, vocab_size, vocab_size)
+
             trainer.train_minibatch({inp: features, label: labels})
             pp.update_with_trainer(trainer)
             print(i, ' training...')
         pp.epoch_summary()
+
     test_features, test_labels = generate_batch(minibatch_size, skip_window)
+    test_features = get_one_hot(test_features)
     test_labels = get_one_hot(test_labels)
+    
     avg_error = trainer.test_minibatch({inp: test_features, label: test_labels})
     print('Avg. Error on Test Set: ', avg_error)
 
