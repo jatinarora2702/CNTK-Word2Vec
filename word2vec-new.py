@@ -5,6 +5,7 @@ from __future__ import print_function
 import collections
 import math
 import os
+import pickle
 import random
 import sys
 import zipfile
@@ -21,42 +22,78 @@ from cntk.utils import ProgressPrinter
 
 
 curr_epoch = 0
-emb_size = 256
-minibatch_size = 512
-num_epochs = 1
+emb_size = 16
+max_range = 300
+minibatch_size = 100
+num_epochs = 10
+num_samples = 100
 skip_window = 1
-vocab_size = 10000
-words_per_epoch = 10000
+vocab_size = 32
+words_per_epoch = 32
 words_seen = 0
+words_to_train = 16
 
 
 data = list()
 id2word = list()
 vocab_count = list()
+paramdict = {'emb': None, 'wt': None, 'b': None, 'embinp': None, 'z': None, 'interm': None, 'sfmaxz': None, 'tmp1': None, 'tmp2': None, 'lt': None, 'ls': None, 'loss': None, 'normloss': None}
+
+
+dictpickle = 'w2v-dict-tmp.pkl'
+embpickle = 'w2v-emb-tmp.pkl'
 
 
 def lrmodel(inp, out_dim):
     inp_dim = inp.shape[0]
     wt = parameter(shape=(inp_dim, out_dim), init=uniform(scale=1.0))
     b = parameter(shape=(out_dim), init=uniform(scale=1.0))
+    interm = times(inp, wt)
+    paramdict['wt'] = wt
+    paramdict['b'] = b
+    paramdict['interm'] = interm
     out = times(inp, wt) + b
     return out
 
 
 def train(emb_size, vocab_size, batch_size, vocab_count):
+    global embeddings, words_to_train
+
     inp = input_variable(shape=(vocab_size,))
     label = input_variable(shape=(vocab_size,))
 
     init_width = 0.5 / emb_size
     emb = parameter(shape=(vocab_size, emb_size), init=uniform(scale=init_width))
+    paramdict['emb'] = emb
     embinp = times(inp, emb)
-    
-    z = lrmodel(embinp, vocab_size)        # logistic regression model
-    loss = cross_entropy_with_softmax(z, label)
-    normloss = element_divide(loss, constant(value=batch_size))
+    paramdict['embinp'] = embinp
 
+    z = lrmodel(embinp, vocab_size)        # logistic regression model
+    paramdict['z'] = z
+
+    print('shp(z): ', z.shape)
+    print('shp(label): ', label.shape)
+    print('shp(minus(constant(value=1), softmax(z))): ', minus(constant(value=1), softmax(z)).shape)
+    print('shp(minus(constant(value=1), label)): ', minus(constant(value=1), label).shape)
+    loss_true = cross_entropy_with_softmax(z, label)
+    paramdict['lt'] = loss_true
+    paramdict['sfmaxz'] = softmax(z)
+    paramdict['tmp1'] = minus(constant(value=1), softmax(z))
+    paramdict['tmp2'] = minus(constant(value=1), label)
+    loss_sample = binary_cross_entropy(minus(constant(value=1), softmax(z)), minus(constant(value=1), label))
+    paramdict['ls'] = loss_sample
+    print('shp(loss_true): ', loss_true.shape)
+    print('shp(loss_sample): ', loss_sample.shape)
+    loss = loss_true + loss_sample
+    paramdict['loss'] = loss
+    print('shp(loss): ', loss.shape)
+    normloss = element_divide(loss, constant(value=batch_size))
+    paramdict['normloss'] = normloss
+    print('shp(normloss): ', normloss.shape)
     eval_error = classification_error(z, label)
-    lr_per_minibatch = learning_rate_schedule([0.005], UnitType.minibatch)
+
+    lr_val = max(0.5, 1.0 - float(words_seen) / words_to_train)
+    lr_per_minibatch = learning_rate_schedule([lr_val], UnitType.minibatch)
     learner = sgd(z.parameters, lr=lr_per_minibatch)
     trainer = Trainer(z, normloss, eval_error, learner)
 
@@ -96,17 +133,14 @@ def read_data_zip(filename):
 
 
 def build_dataset(words):
-    global data, vocab_size, vocab_count, words_per_epoch, id2word
+    global data, vocab_size, vocab_count, words_per_epoch, id2word, words_to_train
     count = [['UNK', -1]]
     count.extend(collections.Counter(words).most_common(vocab_size - 1))
-    # print(len(count))
-    # print(count[-1])
     dictionary = dict()
     id2word = list()
     for word, _ in count:
         dictionary[word] = len(dictionary)
         id2word.append(word)
-    # print(dictionary)
     data = list()
     unk_count = 0
     for word in words:
@@ -122,6 +156,9 @@ def build_dataset(words):
     for elem in sorted(reverse_dictionary.items()):
         vocab_count.append(count[elem[0]][1])
     words_per_epoch = len(data)
+    words_to_train = num_epochs * words_per_epoch
+    with open(dictpickle, 'wb') as handle:
+        pickle.dump(dictionary, handle)
 
 
 # Helper function to generate a random data sample
@@ -192,6 +229,15 @@ def get_one_hot(origlabels):
     return labels
 
 
+def generate_neg_samples(minibatch_size, num_samples, vocab_size):
+    negs = np.random.choice(max_range, num_samples, replace=False)
+    _samples = np.zeros(shape=(minibatch_size, 1, vocab_size))
+    for i in range(minibatch_size):
+        for elem in negs:
+            _samples[i, 0, elem] = 1
+    return _samples
+
+
 def main():
     # Ensure we always get the same amount of randomness
     np.random.seed(0)
@@ -205,9 +251,10 @@ def main():
     process_text(filename)
 
     inp, label, trainer = train(emb_size, vocab_size, minibatch_size, vocab_count)
-    pp = ProgressPrinter(128)
+    pp = ProgressPrinter(10)
     for _epoch in range(num_epochs):
-        for i in range(200):
+        i = 0
+        while i < 250:
             features, labels = generate_batch(minibatch_size, skip_window)
             features = get_one_hot(features)
             labels = get_one_hot(labels)
@@ -215,12 +262,24 @@ def main():
 
             trainer.train_minibatch({inp: features, label: labels})
             pp.update_with_trainer(trainer)
-            print(i, ' training...')
-        pp.epoch_summary()
 
-    test_features, test_labels = generate_batch(minibatch_size, skip_window)
-    test_features = get_one_hot(test_features)
-    test_labels = get_one_hot(test_labels)
+            # print('val(z): ', paramdict['z'].value)
+            # print('val(interm): ', paramdict['interm'].value)
+
+            print(i, ' training...')
+            i += 1
+        print('here1')
+        pp.epoch_summary()
+        print('here2')
+        with open(embpickle, 'wb') as handle:
+            pickle.dump(paramdict['emb'].value, handle)
+        print('here3')
+
+
+    # test_features, test_labels = generate_batch(minibatch_size, skip_window)
+    # test_features = get_one_hot(test_features)
+    # test_labels = get_one_hot(test_labels)
+    test_features, test_labels = generate_random_data_sample(minibatch_size, vocab_size, vocab_size)
     
     avg_error = trainer.test_minibatch({inp: test_features, label: test_labels})
     print('Avg. Error on Test Set: ', avg_error)
