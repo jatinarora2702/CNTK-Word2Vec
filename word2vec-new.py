@@ -24,20 +24,19 @@ from cntk.utils import ProgressPrinter
 curr_epoch = 0
 emb_size = 16
 max_range = 300
-minibatch_size = 100
+minibatch_size = 128
 num_epochs = 10
 num_samples = 100
 skip_window = 1
-vocab_size = 32
-words_per_epoch = 32
+vocab_size = 512
+words_per_epoch = 512
 words_seen = 0
-words_to_train = 16
+words_to_train = 256
 
 
 data = list()
 id2word = list()
 vocab_count = list()
-paramdict = {'emb': None, 'wt': None, 'b': None, 'embinp': None, 'z': None, 'interm': None, 'sfmaxz': None, 'tmp1': None, 'tmp2': None, 'lt': None, 'ls': None, 'loss': None, 'normloss': None}
 
 
 dictpickle = 'w2v-dict-tmp.pkl'
@@ -48,12 +47,16 @@ def lrmodel(inp, out_dim):
     inp_dim = inp.shape[0]
     wt = parameter(shape=(inp_dim, out_dim), init=uniform(scale=1.0))
     b = parameter(shape=(out_dim), init=uniform(scale=1.0))
-    interm = times(inp, wt)
-    paramdict['wt'] = wt
-    paramdict['b'] = b
-    paramdict['interm'] = interm
     out = times(inp, wt) + b
     return out
+
+
+def generate_neg_samples(num_samples, vocab_size):
+    negs = np.random.choice(max_range, num_samples, replace=False)
+    _samples = np.zeros(shape=(vocab_size,))
+    for elem in negs:
+        _samples[elem] = 1.0 / len(negs)
+    return constant(_samples)
 
 
 def train(emb_size, vocab_size, batch_size, vocab_count):
@@ -64,38 +67,23 @@ def train(emb_size, vocab_size, batch_size, vocab_count):
 
     init_width = 0.5 / emb_size
     emb = parameter(shape=(vocab_size, emb_size), init=uniform(scale=init_width))
-    paramdict['emb'] = emb
     embinp = times(inp, emb)
-    paramdict['embinp'] = embinp
 
     z = lrmodel(embinp, vocab_size)        # logistic regression model
-    paramdict['z'] = z
 
-    print('shp(z): ', z.shape)
-    print('shp(label): ', label.shape)
-    print('shp(minus(constant(value=1), softmax(z))): ', minus(constant(value=1), softmax(z)).shape)
-    print('shp(minus(constant(value=1), label)): ', minus(constant(value=1), label).shape)
     loss_true = cross_entropy_with_softmax(z, label)
-    paramdict['lt'] = loss_true
-    paramdict['sfmaxz'] = softmax(z)
-    paramdict['tmp1'] = minus(constant(value=1), softmax(z))
-    paramdict['tmp2'] = minus(constant(value=1), label)
-    loss_sample = binary_cross_entropy(minus(constant(value=1), softmax(z)), minus(constant(value=1), label))
-    paramdict['ls'] = loss_sample
-    print('shp(loss_true): ', loss_true.shape)
-    print('shp(loss_sample): ', loss_sample.shape)
-    loss = loss_true + loss_sample
-    paramdict['loss'] = loss
-    print('shp(loss): ', loss.shape)
-    normloss = element_divide(loss, constant(value=batch_size))
-    paramdict['normloss'] = normloss
-    print('shp(normloss): ', normloss.shape)
+    # loss_sample = binary_cross_entropy(minus(constant(value=1), softmax(z)), element_divide(minus(constant(value=1), label), vocab_size)) # check implementation of 'binary_cross_entropy'
+    # loss_sample = binary_cross_entropy(minus(constant(value=1), softmax(z)), generate_neg_samples(num_samples, vocab_size)) # not working
+    loss = loss_true
+    # normloss = element_divide(loss, constant(value=batch_size)) # may not be required, check if CNTK already takes avg over batch
     eval_error = classification_error(z, label)
 
-    lr_val = max(0.5, 1.0 - float(words_seen) / words_to_train)
-    lr_per_minibatch = learning_rate_schedule([lr_val], UnitType.minibatch)
-    learner = sgd(z.parameters, lr=lr_per_minibatch)
-    trainer = Trainer(z, normloss, eval_error, learner)
+    lr_per_sample = [0.003]*4 + [0.0015]*24 + [0.0003]
+    lr_per_minibatch = [x * minibatch_size for x in lr_per_sample]
+    lr_schedule = learning_rate_schedule(lr_per_minibatch, UnitType.minibatch)
+    # lr_schedule = learning_rate_schedule([(12, 0.1), (15, 0.01), (1, 0.001)], UnitType.minibatch, 100)
+    learner = sgd(z.parameters, lr=lr_schedule)
+    trainer = Trainer(z, loss, eval_error, learner)
 
     return inp, label, trainer
 
@@ -229,15 +217,6 @@ def get_one_hot(origlabels):
     return labels
 
 
-def generate_neg_samples(minibatch_size, num_samples, vocab_size):
-    negs = np.random.choice(max_range, num_samples, replace=False)
-    _samples = np.zeros(shape=(minibatch_size, 1, vocab_size))
-    for i in range(minibatch_size):
-        for elem in negs:
-            _samples[i, 0, elem] = 1
-    return _samples
-
-
 def main():
     # Ensure we always get the same amount of randomness
     np.random.seed(0)
@@ -251,10 +230,10 @@ def main():
     process_text(filename)
 
     inp, label, trainer = train(emb_size, vocab_size, minibatch_size, vocab_count)
-    pp = ProgressPrinter(10)
+    pp = ProgressPrinter(50)
     for _epoch in range(num_epochs):
         i = 0
-        while i < 250:
+        while curr_epoch == _epoch:
             features, labels = generate_batch(minibatch_size, skip_window)
             features = get_one_hot(features)
             labels = get_one_hot(labels)
@@ -262,18 +241,11 @@ def main():
 
             trainer.train_minibatch({inp: features, label: labels})
             pp.update_with_trainer(trainer)
-
-            # print('val(z): ', paramdict['z'].value)
-            # print('val(interm): ', paramdict['interm'].value)
-
-            print(i, ' training...')
             i += 1
-        print('here1')
+
         pp.epoch_summary()
-        print('here2')
         with open(embpickle, 'wb') as handle:
             pickle.dump(paramdict['emb'].value, handle)
-        print('here3')
 
 
     # test_features, test_labels = generate_batch(minibatch_size, skip_window)
